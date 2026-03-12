@@ -12,9 +12,7 @@ AUTH_URL = "https://auth.apps.paloaltonetworks.com/am/oauth2/access_token"
 BASE_API_URL = "https://api.sase.paloaltonetworks.com/cngfw-aws/v2"
 
 def enable_debug():
-    """
-    Enables low-level HTTP debugging to see raw requests and responses.
-    """
+    """Enables low-level HTTP debugging to see raw requests and responses."""
     http.client.HTTPConnection.debuglevel = 1
     logging.basicConfig()
     logging.getLogger().setLevel(logging.DEBUG)
@@ -23,78 +21,92 @@ def enable_debug():
     requests_log.propagate = True
 
 def get_args():
-    """
-    Parse command line arguments for AWS CNGFW configuration and authentication.
-    """
-    parser = argparse.ArgumentParser(description="Provision Palo Alto Networks AWS Cloud NGFW via SCM.")
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Manage Palo Alto Networks AWS Cloud NGFW via SCM API.",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
     
-    # Action
+    # ---------------------------------------------------------
+    # ACTION
+    # ---------------------------------------------------------
     parser.add_argument(
         "--action", 
-        choices=["create"], 
-        default="create",
-        help="The action to perform (currently supports 'create')"
+        choices=["create", "read", "update-general", "update-endpoint-management"], 
+        default="read",
+        help="The action to perform (default: 'read')"
     )
 
-    # Required Firewall Config
-    parser.add_argument("--region", required=True, help="Target AWS region (e.g., us-west-2)")
-    parser.add_argument("--name", required=True, help="The name of the firewall (applied as an AWS Tag)")
-    parser.add_argument("--account", required=True, help="The AWS Account ID to allowlist (e.g., 747599260984)")
-    parser.add_argument("--zones", required=True, help="Comma-separated list of Availability Zone IDs (e.g., usw2-az1,usw2-az2)")
+    # ---------------------------------------------------------
+    # COMMON ARGUMENTS (Required for all actions)
+    # ---------------------------------------------------------
+    common = parser.add_argument_group("Common Parameters (Required for all actions)")
+    common.add_argument("--tsg", required=True, help="The Tenant Service Group (TSG) ID")
+    common.add_argument("--region", required=True, help="Target AWS region (e.g., us-west-2) [Used in query params]")
     
-    # Required SCM Context
-    parser.add_argument("--tsg", required=True, help="The Tenant Service Group (TSG) ID")
-    parser.add_argument("--panw_region", default="americas", help="The PANW control plane region (default: americas)")
+    # ---------------------------------------------------------
+    # IDENTIFICATION ARGUMENTS
+    # ---------------------------------------------------------
+    id_group = parser.add_argument_group("Identification Parameters")
+    id_group.add_argument("--fw_id", help="The SCM Firewall ID (e.g., fw-BZT3DZ3MO) [Required for read/update]")
+    id_group.add_argument("--name", help="The friendly name of the firewall (applied as an AWS Tag) [Required for create]")
+
+    # ---------------------------------------------------------
+    # CONFIGURATION ARGUMENTS (Used for create & update)
+    # ---------------------------------------------------------
+    config_group = parser.add_argument_group("Configuration Parameters")
+    config_group.add_argument("--account", help="AWS Account IDs to allowlist. Can be comma-separated for updates. [Required for create, used in update-endpoint-management]")
+    config_group.add_argument("--zones", help="Comma-separated list of Availability Zone IDs [Required for create, used in update-general]")
+    config_group.add_argument("--description", help="Description of the firewall [Used in update-general]")
+
+    # ---------------------------------------------------------
+    # ADVANCED / OVERRIDES
+    # ---------------------------------------------------------
+    advanced = parser.add_argument_group("Advanced & Authentication")
+    advanced.add_argument("--panw_region", default="americas", help="The PANW control plane region header (default: americas)")
+    advanced.add_argument("--client_id", help="OAuth2 Client ID (can also use SCM_CLIENT_ID env var)")
+    advanced.add_argument("--debug", action="store_true", help="Enable raw HTTP request/response logging")
     
-    # Authentication Overrides
-    parser.add_argument("--client_id", help="OAuth2 Client ID (can also use SCM_CLIENT_ID env var)")
-    
-    # Debug Flag
-    parser.add_argument("--debug", action="store_true", help="Enable raw HTTP request/response logging")
-    
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # --- Strict Argument Validation Logic ---
+    if args.action == "create":
+        if not all([args.name, args.account, args.zones]):
+            parser.error("--name, --account, and --zones are REQUIRED when --action is 'create'")
+    elif args.action in ["read", "update-general", "update-endpoint-management"]:
+        if not args.fw_id:
+             parser.error(f"--fw_id is REQUIRED when --action is '{args.action}'")
+             
+    # Specific Update Validations
+    if args.action == "update-general" and not (args.zones or args.description):
+        parser.error("For 'update-general', you must provide at least --zones or --description to update.")
+    if args.action == "update-endpoint-management" and not args.account:
+        parser.error("For 'update-endpoint-management', you must provide --account to update.")
+
+    return args
 
 def fetch_bearer_token(tsg_id: str, client_id: str, client_secret: str) -> str:
-    """
-    Exchanges Client Credentials for an OAuth2 Access Token.
-    """
+    """Exchanges Client Credentials for an OAuth2 Access Token."""
     print(f"--- Requesting new access token for TSG {tsg_id} ---")
-    
-    payload = {
-        "grant_type": "client_credentials",
-        "scope": f"tsg_id:{tsg_id}"
-    }
-    
+    payload = {"grant_type": "client_credentials", "scope": f"tsg_id:{tsg_id}"}
     try:
         response = requests.post(AUTH_URL, auth=(client_id, client_secret), data=payload, timeout=15)
         response.raise_for_status()
-        token_data = response.json()
-        return token_data.get("access_token")
-    except requests.exceptions.HTTPError as e:
-        print(f"Authentication Failed: {e}")
-        if response.status_code == 401:
-            print("Check if your Client ID and Client Secret are correct.")
-        sys.exit(1)
+        return response.json().get("access_token")
     except Exception as e:
-        print(f"An unexpected error occurred during auth: {e}")
+        print(f"Authentication Failed: {e}")
         sys.exit(1)
 
 def get_headers(args: argparse.Namespace) -> Dict[str, str]:
-    """
-    Determines the best way to get a token and constructs headers.
-    """
+    """Determines the best way to get a token and constructs headers."""
     token = os.environ.get("SCM_TOKEN")
-    
     if not token:
         c_id = args.client_id or os.environ.get("SCM_CLIENT_ID")
         c_secret = os.environ.get("SCM_CLIENT_SECRET")
-        
         if c_id and c_secret:
             token = fetch_bearer_token(args.tsg, c_id, c_secret)
         else:
-            print("Error: No authentication method found.")
-            print("Missing credentials. Please set the SCM_CLIENT_SECRET environment variable.")
-            print("Usage: export SCM_CLIENT_SECRET='your_secret'")
+            print("Missing credentials. Please set SCM_CLIENT_SECRET env var.")
             sys.exit(1)
 
     return {
@@ -105,93 +117,163 @@ def get_headers(args: argparse.Namespace) -> Dict[str, str]:
     }
 
 def get_tenant_link_id(headers: Dict[str, str]) -> Optional[str]:
-    """
-    Helper function: Fetches the active SCM Link ID required for provisioning.
-    """
+    """Fetches the active SCM Link ID required for provisioning."""
     url = f"{BASE_API_URL}/mgmt/tenant"
-    print("\n[GET] Fetching active Tenant Link ID...")
-    
     try:
         response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
         resp_data = response.json()
-        
         if resp_data.get("ResponseStatus", {}).get("ErrorCode") == 0:
-            link_id = resp_data.get("Response", {}).get("ScmInfo", {}).get("LinkId")
-            print(f"  -> Found Link ID: {link_id}")
-            return link_id
-        else:
-            print("API responded, but returned an error payload.")
-            print(json.dumps(resp_data, indent=2))
-            return None
-            
-    except requests.exceptions.HTTPError as e:
-        print(f"Failed to fetch Link ID: {e}")
-        print(f"Server Response Body: {response.text}")
+            return resp_data.get("Response", {}).get("ScmInfo", {}).get("LinkId")
         return None
+    except Exception:
+        return None
+
+def fetch_current_firewall_state(fw_id: str, region: str, headers: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    """Helper function to fetch the current state and optimistic locking tokens."""
+    url = f"{BASE_API_URL}/config/ngfirewalls/{fw_id}"
+    params = {"region": region}
+    print(f"\n[GET] Fetching current state for Firewall '{fw_id}' (needed for UpdateTokens)...")
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("ResponseStatus", {}).get("ErrorCode") == 0:
+            return data.get("Response", {}).get("Firewall", {})
+        else:
+             print("[ERROR] Failed to read firewall state.")
+             return None
     except Exception as e:
-        print(f"An unexpected error occurred while fetching Link ID: {e}")
+        print(f"[ERROR] Failed to fetch current firewall state: {e}")
         return None
 
 def handle_request(args: argparse.Namespace, headers: Dict[str, str]):
-    """
-    Dispatches the appropriate HTTP request based on the requested action.
-    """
+    """Dispatches the appropriate HTTP request based on the requested action."""
+    
+    # ---------------------------------------------------------
+    # ACTION: CREATE
+    # ---------------------------------------------------------
     if args.action == "create":
-        
-        # Step 1: We must resolve the Link ID first
         link_id = get_tenant_link_id(headers)
         if not link_id:
             print("\n[ERROR] Aborting firewall creation due to missing Link ID.")
             sys.exit(1)
 
-        # Step 2: Build the creation payload
         url = f"{BASE_API_URL}/config/ngfirewalls"
-        params = {"region": args.region}
-        
-        # Clean up the zones input (handle spaces after commas)
         zone_list = [z.strip() for z in args.zones.split(",")]
-
         payload = {
             "AllowListAccounts": [args.account],
-            "Tags": [
-                {
-                    "Key": "FirewallName",
-                    "Value": args.name
-                }
-            ],
+            "Tags": [{"Key": "FirewallName", "Value": args.name}],
             "LinkId": link_id,
             "CustomerZoneIdList": zone_list
         }
 
         print(f"\n[POST] Provisioning CNGFW: '{args.name}' in {args.region}...")
-        
         try:
-            response = requests.post(url, headers=headers, params=params, json=payload, timeout=15)
+            response = requests.post(url, headers=headers, params={"region": args.region}, json=payload, timeout=15)
             response.raise_for_status()
             resp_data = response.json()
-            
             if resp_data.get("ResponseStatus", {}).get("ErrorCode") == 0:
-                fw_id = resp_data.get("Response", {}).get("FirewallId")
-                print("\n  -> Success! Firewall provisioning initiated.")
-                print(f"  -> Your new Firewall ID is: {fw_id}")
-                print("\nFull Response:")
+                print(f"\n  -> Success! New Firewall ID: {resp_data.get('Response', {}).get('FirewallId')}")
+            else:
+                print("\n[ERROR] Payload error:", json.dumps(resp_data, indent=2))
+        except Exception as e:
+            print(f"\n[ERROR] Create failed: {e}")
+
+    # ---------------------------------------------------------
+    # ACTION: READ
+    # ---------------------------------------------------------
+    elif args.action == "read":
+        url = f"{BASE_API_URL}/config/ngfirewalls/{args.fw_id}"
+        print(f"\n[GET] Reading configuration for Firewall ID: '{args.fw_id}'...")
+        try:
+            response = requests.get(url, headers=headers, params={"region": args.region}, timeout=15)
+            response.raise_for_status()
+            resp_data = response.json()
+            if resp_data.get("ResponseStatus", {}).get("ErrorCode") == 0:
+                status = resp_data.get("Response", {}).get("Status", {})
+                print(f"\n  -> Success! Deployment Status: {status.get('FirewallStatus')}")
                 print(json.dumps(resp_data, indent=2))
             else:
-                print("\n[ERROR] API responded, but returned an error payload.")
-                print(json.dumps(resp_data, indent=2))
-                
-        except requests.exceptions.HTTPError as e:
-            print(f"\n[ERROR] Action '{args.action}' Failed: {e}")
-            try:
-                print("Server Error Details:", json.dumps(response.json(), indent=2))
-            except:
-                print(f"Server Response Body: {response.text}")
+                print("\n[ERROR] Payload error:", json.dumps(resp_data, indent=2))
         except Exception as e:
-            print(f"\n[ERROR] An unexpected error occurred: {e}")
+            print(f"\n[ERROR] Read failed: {e}")
+
+    # ---------------------------------------------------------
+    # ACTION: UPDATE GENERAL
+    # ---------------------------------------------------------
+    elif args.action == "update-general":
+        current_state = fetch_current_firewall_state(args.fw_id, args.region, headers)
+        if not current_state:
+            sys.exit(1)
+
+        # Build payload based on capture, persisting existing tokens and tags
+        payload = {
+            "FirewallId": args.fw_id,
+            "Region": args.region,
+            "UpdateToken": current_state.get("UpdateToken"),
+            "DeploymentUpdateToken": current_state.get("DeploymentUpdateToken"),
+            "Tags": current_state.get("Tags", [])
+        }
+        
+        # Apply intended updates
+        if args.zones:
+            payload["CustomerZoneIdList"] = [z.strip() for z in args.zones.split(",")]
+        else:
+            payload["CustomerZoneIdList"] = current_state.get("CustomerZoneIdList", [])
             
-    else:
-        print(f"Action '{args.action}' is not fully implemented in this script yet.")
+        if args.description:
+            payload["Description"] = args.description
+        elif current_state.get("Description"):
+            payload["Description"] = current_state.get("Description")
+
+        url = f"{BASE_API_URL}/config/ngfirewalls/{args.fw_id}"
+        print(f"\n[PATCH] Applying General Update to Firewall: '{args.fw_id}'...")
+        
+        try:
+            response = requests.patch(url, headers=headers, params={"region": args.region}, json=payload, timeout=15)
+            response.raise_for_status()
+            print("\n  -> Success! General properties updated.")
+            print(json.dumps(response.json(), indent=2))
+        except Exception as e:
+             print(f"\n[ERROR] Update failed: {e}")
+             if 'response' in locals(): print(response.text)
+
+    # ---------------------------------------------------------
+    # ACTION: UPDATE ENDPOINT MANAGEMENT
+    # ---------------------------------------------------------
+    elif args.action == "update-endpoint-management":
+        current_state = fetch_current_firewall_state(args.fw_id, args.region, headers)
+        if not current_state:
+            sys.exit(1)
+
+        # Ensure we pass back the current EndpointServiceName if it exists
+        svc_name = current_state.get("EndpointServiceName")
+        
+        payload = {
+            "FirewallId": args.fw_id,
+            "Region": args.region,
+            "UpdateToken": current_state.get("UpdateToken"),
+            "DeploymentUpdateToken": current_state.get("DeploymentUpdateToken"),
+            "Endpoints": current_state.get("Endpoints", []),
+            "AllowListAccounts": [a.strip() for a in args.account.split(",")]
+        }
+        
+        if svc_name:
+            payload["EndpointServiceName"] = svc_name
+
+        url = f"{BASE_API_URL}/config/ngfirewalls/{args.fw_id}"
+        print(f"\n[PATCH] Applying Endpoint Management Update to Firewall: '{args.fw_id}'...")
+        
+        try:
+            response = requests.patch(url, headers=headers, params={"region": args.region}, json=payload, timeout=15)
+            response.raise_for_status()
+            print("\n  -> Success! Endpoint management / Allowlist updated.")
+            print(json.dumps(response.json(), indent=2))
+        except Exception as e:
+             print(f"\n[ERROR] Update failed: {e}")
+             if 'response' in locals(): print(response.text)
+
 
 def main():
     args = get_args()
