@@ -1,4 +1,3 @@
-```markdown
 # SCM AWS Cloud NGFW Provisioning Script
 
 This Python script automates the provisioning of Palo Alto Networks Cloud Next-Generation Firewalls (CNGFW) for AWS using the Strata Cloud Manager (SCM) API. 
