@@ -1,0 +1,50 @@
+# ---------------------------------------------------
+# Python Virtual Environments
+# ---------------------------------------------------
+venv/
+env/
+.venv/
+Pipfile.lock
+
+# ---------------------------------------------------
+# Secrets & Environment Variables
+# ---------------------------------------------------
+# NEVER commit files containing credentials
+.env
+.env.*
+*.pem
+*.key
+
+# ---------------------------------------------------
+# Python Cache & Byte-compiled Files
+# ---------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ---------------------------------------------------
+# Logs & Debugging
+# ---------------------------------------------------
+*.log
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ---------------------------------------------------
+# OS & IDE Specific Files
+# ---------------------------------------------------
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# IDEs (VS Code, PyCharm, etc.)
+.vscode/
+.idea/
+*.swp
+*.swo
